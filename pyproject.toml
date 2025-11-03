@@ -10,4 +10,9 @@ dependencies = [
     "matplotlib>=3.10.7",
     "notebook>=7.4.7",
     "numpy>=2.3.4",
+    "seaborn>=0.13.2",
+    "tensorflow>=2.20.0",
+    "tf-keras>=2.20.1",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
 ]
