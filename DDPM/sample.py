@@ -1,0 +1,371 @@
+"""
+Sampling script for DDPM.
+Generate images from trained models.
+"""
+
+import os
+import sys
+import argparse
+from pathlib import Path
+from typing import Optional
+
+import torch
+import torchvision
+from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from config import Config, get_config
+from models import create_model, create_diffusion
+from utils import unnormalize
+
+
+def load_model_from_checkpoint(
+    checkpoint_path: str,
+    config: Config,
+    device: torch.device,
+    use_ema: bool = True,
+):
+    """
+    Load model from checkpoint.
+
+    Args:
+        checkpoint_path: Path to checkpoint
+        config: Model configuration
+        device: Device to load to
+        use_ema: Whether to use EMA weights
+
+    Returns:
+        Diffusion model ready for sampling
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model = create_model(config).to(device)
+
+    if use_ema and "ema_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["ema_state_dict"])
+        print("Loaded EMA weights")
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print("Loaded model weights")
+
+    model.eval()
+    diffusion = create_diffusion(model, config).to(device)
+
+    return diffusion
+
+
+@torch.no_grad()
+def generate_samples(
+    diffusion,
+    num_samples: int,
+    batch_size: int,
+    image_size: int,
+    output_dir: Path,
+    device: torch.device,
+    save_individual: bool = False,
+    prefix: str = "sample",
+):
+    """
+    Generate samples from diffusion model.
+
+    Args:
+        diffusion: Diffusion model
+        num_samples: Total number of samples to generate
+        batch_size: Batch size for generation
+        image_size: Image size
+        output_dir: Directory to save samples
+        device: Device to use
+        save_individual: Whether to save individual images
+        prefix: Prefix for saved files
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_samples = []
+    num_batches = (num_samples + batch_size - 1) // batch_size
+
+    for i in tqdm(range(num_batches), desc="Generating samples"):
+        current_batch_size = min(batch_size, num_samples - i * batch_size)
+
+        samples = diffusion.sample(
+            batch_size=current_batch_size,
+            image_size=image_size,
+            progress=False,
+        )
+
+        # Unnormalize
+        samples = unnormalize(samples)
+        samples = torch.clamp(samples, 0, 1)
+
+        all_samples.append(samples.cpu())
+
+        # Save individual images if requested
+        if save_individual:
+            for j, sample in enumerate(samples):
+                idx = i * batch_size + j
+                save_path = output_dir / f"{prefix}_{idx:05d}.png"
+                torchvision.utils.save_image(sample, save_path)
+
+    # Concatenate all samples
+    all_samples = torch.cat(all_samples, dim=0)[:num_samples]
+
+    # Save grid of first 64 samples
+    grid_samples = all_samples[:64]
+    grid = torchvision.utils.make_grid(grid_samples, nrow=8, padding=2)
+    grid_path = output_dir / f"{prefix}_grid.png"
+    torchvision.utils.save_image(grid, grid_path)
+
+    # Save all samples as a single tensor file (for FID calculation)
+    tensor_path = output_dir / f"{prefix}_all.pt"
+    torch.save(all_samples, tensor_path)
+
+    print(f"Saved {num_samples} samples to {output_dir}")
+    print(f"Grid saved to {grid_path}")
+    print(f"Tensor saved to {tensor_path}")
+
+    return all_samples
+
+
+@torch.no_grad()
+def generate_interpolation(
+    diffusion,
+    num_steps: int = 10,
+    image_size: int = 32,
+    output_dir: Path = Path("./samples"),
+    device: torch.device = torch.device("cpu"),
+):
+    """
+    Generate interpolation between two random noise samples.
+
+    Args:
+        diffusion: Diffusion model
+        num_steps: Number of interpolation steps
+        image_size: Image size
+        output_dir: Directory to save results
+        device: Device to use
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate two random noise vectors
+    z1 = torch.randn(1, 3, image_size, image_size, device=device)
+    z2 = torch.randn(1, 3, image_size, image_size, device=device)
+
+    # Interpolate
+    alphas = torch.linspace(0, 1, num_steps)
+    samples = []
+
+    for alpha in tqdm(alphas, desc="Interpolating"):
+        # Spherical interpolation
+        z = slerp(alpha.item(), z1, z2)
+
+        # Denoise from this starting point
+        x = z.clone()
+        for t in reversed(range(diffusion.timesteps)):
+            t_batch = torch.full((1,), t, device=device, dtype=torch.long)
+            x = diffusion.p_sample(x, t_batch)
+
+        samples.append(unnormalize(x).clamp(0, 1).cpu())
+
+    # Save as grid
+    samples = torch.cat(samples, dim=0)
+    grid = torchvision.utils.make_grid(samples, nrow=num_steps, padding=2)
+    save_path = output_dir / "interpolation.png"
+    torchvision.utils.save_image(grid, save_path)
+
+    print(f"Interpolation saved to {save_path}")
+
+    return samples
+
+
+def slerp(alpha: float, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+    """
+    Spherical linear interpolation.
+
+    Args:
+        alpha: Interpolation factor (0 = z1, 1 = z2)
+        z1: First vector
+        z2: Second vector
+
+    Returns:
+        Interpolated vector
+    """
+    z1_flat = z1.flatten()
+    z2_flat = z2.flatten()
+
+    # Normalize
+    z1_norm = z1_flat / z1_flat.norm()
+    z2_norm = z2_flat / z2_flat.norm()
+
+    # Compute angle
+    omega = torch.acos((z1_norm * z2_norm).sum().clamp(-1, 1))
+
+    if omega.abs() < 1e-10:
+        return (1 - alpha) * z1 + alpha * z2
+
+    # Slerp
+    sin_omega = torch.sin(omega)
+    result = (
+        torch.sin((1 - alpha) * omega) / sin_omega * z1_flat
+        + torch.sin(alpha * omega) / sin_omega * z2_flat
+    )
+
+    return result.reshape(z1.shape)
+
+
+@torch.no_grad()
+def generate_denoising_process(
+    diffusion,
+    image_size: int = 32,
+    num_images: int = 4,
+    num_vis_steps: int = 10,
+    output_dir: Path = Path("./samples"),
+    device: torch.device = torch.device("cpu"),
+):
+    """
+    Visualize the denoising process.
+
+    Args:
+        diffusion: Diffusion model
+        image_size: Image size
+        num_images: Number of images to generate
+        num_vis_steps: Number of steps to visualize
+        output_dir: Directory to save results
+        device: Device to use
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate samples with intermediates
+    samples, intermediates = diffusion.sample(
+        batch_size=num_images,
+        image_size=image_size,
+        return_intermediates=True,
+        progress=True,
+    )
+
+    # Select steps to visualize
+    total_steps = len(intermediates)
+    vis_indices = [int(i * (total_steps - 1) / (num_vis_steps - 1)) for i in range(num_vis_steps)]
+
+    # Create visualization grid
+    vis_samples = []
+    for idx in vis_indices:
+        step_samples = unnormalize(intermediates[idx]).clamp(0, 1)
+        vis_samples.append(step_samples)
+
+    # Stack: [num_vis_steps, num_images, C, H, W]
+    vis_samples = torch.stack(vis_samples, dim=0)
+
+    # Rearrange for grid: show each image's denoising process as a row
+    rows = []
+    for i in range(num_images):
+        row = vis_samples[:, i]  # [num_vis_steps, C, H, W]
+        rows.append(row)
+
+    grid_samples = torch.cat(rows, dim=0)  # [num_images * num_vis_steps, C, H, W]
+    grid = torchvision.utils.make_grid(grid_samples, nrow=num_vis_steps, padding=2)
+
+    save_path = output_dir / "denoising_process.png"
+    torchvision.utils.save_image(grid, save_path)
+
+    print(f"Denoising process visualization saved to {save_path}")
+
+    return vis_samples
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate samples from DDPM")
+
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to model checkpoint")
+    parser.add_argument("--output-dir", type=str, default="./generated",
+                        help="Output directory for samples")
+    parser.add_argument("--num-samples", type=int, default=64,
+                        help="Number of samples to generate")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Batch size for generation")
+
+    # Model config
+    parser.add_argument("--timesteps", type=int, default=1000,
+                        help="Number of diffusion timesteps")
+    parser.add_argument("--beta-schedule", type=str, default="linear",
+                        choices=["linear", "cosine", "quadratic"],
+                        help="Beta schedule type")
+    parser.add_argument("--image-size", type=int, default=32,
+                        help="Image size")
+
+    # Options
+    parser.add_argument("--no-ema", action="store_true",
+                        help="Use model weights instead of EMA")
+    parser.add_argument("--save-individual", action="store_true",
+                        help="Save individual images")
+    parser.add_argument("--interpolation", action="store_true",
+                        help="Generate interpolation visualization")
+    parser.add_argument("--denoising-vis", action="store_true",
+                        help="Generate denoising process visualization")
+
+    # Device
+    parser.add_argument("--device", type=str, default="cuda",
+                        choices=["cuda", "mps", "cpu"],
+                        help="Device to use")
+
+    args = parser.parse_args()
+
+    # Setup device
+    if args.device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif args.device == "mps" and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    print(f"Using device: {device}")
+
+    # Create config
+    config = get_config(
+        timesteps=args.timesteps,
+        beta_schedule=args.beta_schedule,
+    )
+    config.model.image_size = args.image_size
+
+    # Load model
+    diffusion = load_model_from_checkpoint(
+        args.checkpoint,
+        config,
+        device,
+        use_ema=not args.no_ema,
+    )
+
+    output_dir = Path(args.output_dir)
+
+    # Generate samples
+    if args.interpolation:
+        generate_interpolation(
+            diffusion,
+            output_dir=output_dir,
+            device=device,
+            image_size=args.image_size,
+        )
+    elif args.denoising_vis:
+        generate_denoising_process(
+            diffusion,
+            output_dir=output_dir,
+            device=device,
+            image_size=args.image_size,
+        )
+    else:
+        generate_samples(
+            diffusion,
+            num_samples=args.num_samples,
+            batch_size=args.batch_size,
+            image_size=args.image_size,
+            output_dir=output_dir,
+            device=device,
+            save_individual=args.save_individual,
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,32 @@
+[project]
+name = "ddpm"
+version = "0.1.0"
+description = "Reproduction of Ho et al. 2020 'Denoising Diffusion Probabilistic Models'"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "pillow>=9.0.0",
+    "tqdm>=4.65.0",
+    "einops>=0.6.0",
+    "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "ruff",
+    "pytest",
+]
+
+[project.scripts]
+ddpm = "main:main"
+
+[tool.uv]
+dev-dependencies = [
+    "black",
+    "ruff",
+    "pytest",
+]
