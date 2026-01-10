@@ -3,26 +3,27 @@ Evaluation script for DDPM.
 Computes FID score between generated samples and real data.
 """
 
+import argparse
 import os
 import sys
-import argparse
 from pathlib import Path
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy import linalg
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 from torchvision.datasets import CIFAR10
-import numpy as np
-from scipy import linalg
+from torchvision.models import Inception_V3_Weights
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import Config, get_config
-from models import create_model, create_diffusion
+from models import create_diffusion, create_model
 from utils import unnormalize
 
 
@@ -36,7 +37,7 @@ class InceptionV3Features(nn.Module):
         super().__init__()
 
         # Load pretrained Inception V3
-        inception = models.inception_v3(pretrained=True)
+        inception = models.inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
 
         # Extract layers up to pool3
         self.blocks = nn.Sequential(
@@ -257,11 +258,15 @@ def compute_cifar10_stats(
     print("Computing CIFAR-10 statistics...")
 
     # Load CIFAR-10
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+        ]
+    )
     dataset = CIFAR10(root=data_dir, train=True, download=True, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=4
+    )
 
     # Initialize Inception model
     inception = InceptionV3Features().to(device)
@@ -361,7 +366,9 @@ def evaluate_model(
     # Get real statistics
     if stats_path is None:
         stats_path = Path(data_dir) / "cifar10_fid_stats.npz"
-    mu_real, sigma_real = compute_cifar10_stats(data_dir, device, batch_size, str(stats_path))
+    mu_real, sigma_real = compute_cifar10_stats(
+        data_dir, device, batch_size, str(stats_path)
+    )
 
     # Compute FID
     fid = compute_fid(mu_real, sigma_real, mu_gen, sigma_gen)
@@ -384,34 +391,51 @@ def evaluate_model(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate DDPM model")
 
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to model checkpoint")
-    parser.add_argument("--num-samples", type=int, default=50000,
-                        help="Number of samples for FID calculation")
-    parser.add_argument("--batch-size", type=int, default=256,
-                        help="Batch size")
+    parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Path to model checkpoint"
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=50000,
+        help="Number of samples for FID calculation",
+    )
+    parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
 
     # Model config
-    parser.add_argument("--timesteps", type=int, default=1000,
-                        help="Number of diffusion timesteps")
-    parser.add_argument("--beta-schedule", type=str, default="linear",
-                        choices=["linear", "cosine", "quadratic"],
-                        help="Beta schedule type")
+    parser.add_argument(
+        "--timesteps", type=int, default=1000, help="Number of diffusion timesteps"
+    )
+    parser.add_argument(
+        "--beta-schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine", "quadratic"],
+        help="Beta schedule type",
+    )
 
     # Paths
-    parser.add_argument("--data-dir", type=str, default="./data",
-                        help="Data directory")
-    parser.add_argument("--stats-path", type=str, default=None,
-                        help="Path to precomputed CIFAR-10 stats")
+    parser.add_argument("--data-dir", type=str, default="./data", help="Data directory")
+    parser.add_argument(
+        "--stats-path",
+        type=str,
+        default=None,
+        help="Path to precomputed CIFAR-10 stats",
+    )
 
     # Options
-    parser.add_argument("--no-ema", action="store_true",
-                        help="Use model weights instead of EMA")
+    parser.add_argument(
+        "--no-ema", action="store_true", help="Use model weights instead of EMA"
+    )
 
     # Device
-    parser.add_argument("--device", type=str, default="cuda",
-                        choices=["cuda", "mps", "cpu"],
-                        help="Device to use")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "mps", "cpu"],
+        help="Device to use",
+    )
 
     args = parser.parse_args()
 
