@@ -83,10 +83,14 @@ def prepare_latents(
     scaling = config.vae.latent_scaling_factor
     use_fp16 = config.vae.use_fp16
 
-    print(f"Encoding latents for {config.data.dataset} at {config.data.image_size}px...")
+    print(
+        f"Encoding latents for {config.data.dataset} at {config.data.image_size}px..."
+    )
     print(f"  VAE: {config.vae.model_id}")
     print(f"  Downsample factor: {config.vae.downsample_factor}")
-    print(f"  Expected latent size: {config.data.image_size // config.vae.downsample_factor}x{config.data.image_size // config.vae.downsample_factor}")
+    print(
+        f"  Expected latent size: {config.data.image_size // config.vae.downsample_factor}x{config.data.image_size // config.vae.downsample_factor}"
+    )
 
     for batch in dataloader:
         images, labels = batch
