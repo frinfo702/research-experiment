@@ -1,15 +1,19 @@
 #!/bin/bash
 # Quick debug run for local testing on Mac M4
 # Shorter training to verify everything works
+# 128px input -> 32x32 latent (f=4)
 
 set -e
 
 # Configuration - debug settings
 TIMESTEPS=1000
-SCHEDULE="linear"
+SCHEDULE="cosine"
 TOTAL_STEPS=1000
-BATCH_SIZE=32  # Smaller for M4 Mac
+BATCH_SIZE=8   # Very small for M4 Mac with 128px
 DEVICE="mps"   # Use Metal for Mac
+IMAGE_SIZE=128
+DATASET="celeba_hq_256"
+DOWNSAMPLE_FACTOR=4
 
 # Directories
 OUTPUT_DIR="./outputs"
@@ -24,7 +28,10 @@ uv run python train.py \
     --device $DEVICE \
     --output-dir $OUTPUT_DIR \
     --data-dir $DATA_DIR \
-    --exp-name "ddpm_debug" \
+    --image-size $IMAGE_SIZE \
+    --dataset $DATASET \
+    --downsample-factor $DOWNSAMPLE_FACTOR \
+    --exp-name "ldm_debug" \
     --debug
 
 echo "Debug run complete!"

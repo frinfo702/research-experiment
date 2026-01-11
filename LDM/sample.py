@@ -1,6 +1,6 @@
 """
-Sampling script for DDPM.
-Generate images from trained models.
+Sampling script for LDM.
+Generate images from trained latent diffusion models.
 """
 
 import os
@@ -12,6 +12,7 @@ from typing import Optional
 import torch
 import torchvision
 from tqdm import tqdm
+from diffusers import AutoencoderKL
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -55,12 +56,33 @@ def load_model_from_checkpoint(
     return diffusion
 
 
+def load_vae(config: Config, device: torch.device) -> AutoencoderKL:
+    dtype = torch.float16 if (config.vae.use_fp16 and device.type == "cuda") else torch.float32
+    vae = AutoencoderKL.from_pretrained(
+        config.vae.model_id,
+        subfolder=config.vae.subfolder,
+    ).to(device, dtype=dtype)
+    vae.eval()
+    for param in vae.parameters():
+        param.requires_grad = False
+    return vae
+
+
+@torch.no_grad()
+def decode_latents(vae, latents: torch.Tensor, scaling: float) -> torch.Tensor:
+    latents = latents / scaling
+    images = vae.decode(latents).sample
+    images = unnormalize(images).clamp(0, 1)
+    return images
+
+
 @torch.no_grad()
 def generate_samples(
     diffusion,
+    vae,
+    config: Config,
     num_samples: int,
     batch_size: int,
-    image_size: int,
     output_dir: Path,
     device: torch.device,
     save_individual: bool = False,
@@ -88,15 +110,14 @@ def generate_samples(
     for i in tqdm(range(num_batches), desc="Generating samples"):
         current_batch_size = min(batch_size, num_samples - i * batch_size)
 
-        samples = diffusion.sample(
+        latents = diffusion.sample(
             batch_size=current_batch_size,
-            image_size=image_size,
+            image_size=config.model.image_size,
+            channels=config.model.out_channels,
             progress=False,
         )
 
-        # Unnormalize
-        samples = unnormalize(samples)
-        samples = torch.clamp(samples, 0, 1)
+        samples = decode_latents(vae, latents, config.vae.latent_scaling_factor)
 
         all_samples.append(samples.cpu())
 
@@ -130,8 +151,9 @@ def generate_samples(
 @torch.no_grad()
 def generate_interpolation(
     diffusion,
+    vae,
+    config: Config,
     num_steps: int = 10,
-    image_size: int = 32,
     output_dir: Path = Path("./samples"),
     device: torch.device = torch.device("cpu"),
 ):
@@ -149,8 +171,9 @@ def generate_interpolation(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate two random noise vectors
-    z1 = torch.randn(1, 3, image_size, image_size, device=device)
-    z2 = torch.randn(1, 3, image_size, image_size, device=device)
+    latent_size = config.model.image_size
+    z1 = torch.randn(1, config.model.in_channels, latent_size, latent_size, device=device)
+    z2 = torch.randn(1, config.model.in_channels, latent_size, latent_size, device=device)
 
     # Interpolate
     alphas = torch.linspace(0, 1, num_steps)
@@ -166,7 +189,8 @@ def generate_interpolation(
             t_batch = torch.full((1,), t, device=device, dtype=torch.long)
             x = diffusion.p_sample(x, t_batch)
 
-        samples.append(unnormalize(x).clamp(0, 1).cpu())
+        decoded = decode_latents(vae, x, config.vae.latent_scaling_factor)
+        samples.append(decoded.cpu())
 
     # Save as grid
     samples = torch.cat(samples, dim=0)
@@ -217,7 +241,8 @@ def slerp(alpha: float, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def generate_denoising_process(
     diffusion,
-    image_size: int = 32,
+    vae,
+    config: Config,
     num_images: int = 4,
     num_vis_steps: int = 10,
     output_dir: Path = Path("./samples"),
@@ -240,7 +265,8 @@ def generate_denoising_process(
     # Generate samples with intermediates
     samples, intermediates = diffusion.sample(
         batch_size=num_images,
-        image_size=image_size,
+        image_size=config.model.image_size,
+        channels=config.model.out_channels,
         return_intermediates=True,
         progress=True,
     )
@@ -252,8 +278,8 @@ def generate_denoising_process(
     # Create visualization grid
     vis_samples = []
     for idx in vis_indices:
-        step_samples = unnormalize(intermediates[idx]).clamp(0, 1)
-        vis_samples.append(step_samples)
+        decoded = decode_latents(vae, intermediates[idx], config.vae.latent_scaling_factor)
+        vis_samples.append(decoded)
 
     # Stack: [num_vis_steps, num_images, C, H, W]
     vis_samples = torch.stack(vis_samples, dim=0)
@@ -276,7 +302,7 @@ def generate_denoising_process(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate samples from DDPM")
+    parser = argparse.ArgumentParser(description="Generate samples from LDM")
 
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
@@ -293,8 +319,16 @@ def main():
     parser.add_argument("--beta-schedule", type=str, default="linear",
                         choices=["linear", "cosine", "quadratic"],
                         help="Beta schedule type")
-    parser.add_argument("--image-size", type=int, default=32,
-                        help="Image size")
+    parser.add_argument("--image-size", type=int, default=128,
+                        help="Input image size")
+    parser.add_argument("--downsample-factor", type=int, default=4,
+                        help="VAE downsample factor (4 for 128px->32x32 latent)")
+    parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse",
+                        help="Hugging Face VAE model id")
+    parser.add_argument("--vae-subfolder", type=str, default=None,
+                        help="Optional VAE subfolder (e.g., 'vae' for SD checkpoints)")
+    parser.add_argument("--vae-fp16", action="store_true",
+                        help="Use FP16 VAE decoding on CUDA")
 
     # Options
     parser.add_argument("--no-ema", action="store_true",
@@ -328,7 +362,20 @@ def main():
         timesteps=args.timesteps,
         beta_schedule=args.beta_schedule,
     )
-    config.model.image_size = args.image_size
+    config.data.image_size = args.image_size
+    config.vae.model_id = args.vae_model_id
+    config.vae.subfolder = args.vae_subfolder
+    config.vae.use_fp16 = args.vae_fp16
+    config.vae.downsample_factor = args.downsample_factor
+    config.device = args.device
+    config.model.image_size = config.data.image_size // config.vae.downsample_factor
+    config.model.in_channels = config.vae.latent_channels
+    config.model.out_channels = config.vae.latent_channels
+
+    if config.device != "cuda":
+        config.vae.use_fp16 = False
+    if config.data.image_size % config.vae.downsample_factor != 0:
+        raise ValueError(f"image_size ({config.data.image_size}) must be divisible by VAE downsample_factor ({config.vae.downsample_factor}).")
 
     # Load model
     diffusion = load_model_from_checkpoint(
@@ -337,6 +384,7 @@ def main():
         device,
         use_ema=not args.no_ema,
     )
+    vae = load_vae(config, device)
 
     output_dir = Path(args.output_dir)
 
@@ -344,23 +392,26 @@ def main():
     if args.interpolation:
         generate_interpolation(
             diffusion,
+            vae,
+            config,
             output_dir=output_dir,
             device=device,
-            image_size=args.image_size,
         )
     elif args.denoising_vis:
         generate_denoising_process(
             diffusion,
+            vae,
+            config,
             output_dir=output_dir,
             device=device,
-            image_size=args.image_size,
         )
     else:
         generate_samples(
             diffusion,
+            vae,
+            config,
             num_samples=args.num_samples,
             batch_size=args.batch_size,
-            image_size=args.image_size,
             output_dir=output_dir,
             device=device,
             save_individual=args.save_individual,

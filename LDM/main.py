@@ -1,27 +1,23 @@
 """
-DDPM: Denoising Diffusion Probabilistic Models
+LDM: Latent Diffusion Models (CIFAR-10)
 
-A reproduction of Ho et al. 2020 "Denoising Diffusion Probabilistic Models"
+Latent diffusion training using a pretrained VAE (AutoencoderKL).
 
 Usage (with uv):
     # Setup
     uv sync
 
-    # Train baseline model (T=1000, linear schedule)
-    uv run python main.py train
+    # Train baseline model (T=1000, cosine schedule)
+    uv run python main.py train --image-size 64 --vae-fp16
 
     # Train with custom settings
-    uv run python main.py train --timesteps 500 --beta-schedule cosine
+    uv run python main.py train --timesteps 500 --beta-schedule cosine --image-size 64
 
     # Generate samples from trained model
-    uv run python main.py sample --checkpoint outputs/ddpm_baseline/checkpoints/checkpoint_latest.pt
+    uv run python main.py sample --checkpoint outputs/ldm_cifar10/checkpoints/checkpoint_latest.pt
 
     # Evaluate FID score
-    uv run python main.py evaluate --checkpoint outputs/ddpm_baseline/checkpoints/checkpoint_latest.pt
-
-    # Run ablation experiments
-    uv run python main.py ablation train
-    uv run python main.py ablation evaluate
+    uv run python main.py evaluate --checkpoint outputs/ldm_cifar10/checkpoints/checkpoint_latest.pt
 
     # Debug run (Mac M4)
     ./scripts/run_baseline_debug.sh
@@ -44,9 +40,9 @@ def main():
     train_parser = subparsers.add_parser("train", help="Train DDPM model")
     train_parser.add_argument("--timesteps", type=int, default=1000,
                               help="Number of diffusion timesteps (default: 1000)")
-    train_parser.add_argument("--beta-schedule", type=str, default="linear",
+    train_parser.add_argument("--beta-schedule", type=str, default="cosine",
                               choices=["linear", "cosine", "quadratic"],
-                              help="Beta schedule type (default: linear)")
+                              help="Beta schedule type (default: cosine)")
     train_parser.add_argument("--batch-size", type=int, default=128,
                               help="Training batch size (default: 128)")
     train_parser.add_argument("--total-steps", type=int, default=800000,
@@ -59,6 +55,27 @@ def main():
                               help="Output directory (default: ./outputs)")
     train_parser.add_argument("--data-dir", type=str, default="./data",
                               help="Data directory (default: ./data)")
+    train_parser.add_argument("--image-size", type=int, default=64,
+                              help="Input image size (default: 64)")
+    train_parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse",
+                              help="Hugging Face VAE model id")
+    train_parser.add_argument("--vae-subfolder", type=str, default=None,
+                              help="Optional VAE subfolder (e.g., 'vae')")
+    train_parser.add_argument("--vae-cache-dir", type=str, default="./data/latents",
+                              help="Directory for cached latents")
+    train_parser.add_argument("--vae-fp16", action="store_true",
+                              help="Use FP16 VAE encoding on CUDA")
+    train_parser.add_argument("--force-latents", action="store_true",
+                              help="Recompute cached latents")
+    train_parser.add_argument("--wandb-project", type=str, default="ldm-cifar10",
+                              help="Weights & Biases project name")
+    train_parser.add_argument("--wandb-entity", type=str, default=None,
+                              help="Weights & Biases entity")
+    train_parser.add_argument("--wandb-key", type=str, default=None,
+                              help="Weights & Biases API key")
+    train_parser.add_argument("--wandb-mode", type=str, default="online",
+                              choices=["online", "offline", "disabled"],
+                              help="Weights & Biases mode")
     train_parser.add_argument("--resume", type=str, default=None,
                               help="Path to checkpoint to resume from")
     train_parser.add_argument("--device", type=str, default="cuda",
@@ -81,11 +98,17 @@ def main():
                                help="Batch size for generation")
     sample_parser.add_argument("--timesteps", type=int, default=1000,
                                help="Number of diffusion timesteps")
-    sample_parser.add_argument("--beta-schedule", type=str, default="linear",
+    sample_parser.add_argument("--beta-schedule", type=str, default="cosine",
                                choices=["linear", "cosine", "quadratic"],
                                help="Beta schedule type")
-    sample_parser.add_argument("--image-size", type=int, default=32,
-                               help="Image size")
+    sample_parser.add_argument("--image-size", type=int, default=64,
+                               help="Input image size")
+    sample_parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse",
+                               help="Hugging Face VAE model id")
+    sample_parser.add_argument("--vae-subfolder", type=str, default=None,
+                               help="Optional VAE subfolder (e.g., 'vae')")
+    sample_parser.add_argument("--vae-fp16", action="store_true",
+                               help="Use FP16 VAE decoding on CUDA")
     sample_parser.add_argument("--no-ema", action="store_true",
                                help="Use model weights instead of EMA")
     sample_parser.add_argument("--save-individual", action="store_true",
