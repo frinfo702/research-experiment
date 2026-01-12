@@ -287,6 +287,24 @@ def compute_cifar10_stats(
     return mu, sigma
 
 
+def _amp_context(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    if device.type == "mps":
+        return torch.autocast(device_type="mps", dtype=torch.float16)
+    return torch.autocast(device_type="cpu", enabled=False)
+
+
+def _sampling_config(use_ddim: bool, ddim_steps: int, ddim_eta: float) -> Tuple[bool, int, float]:
+    if not use_ddim:
+        return False, 0, 0.0
+    if ddim_steps < 2:
+        raise ValueError("ddim-steps must be >= 2")
+    if ddim_eta < 0:
+        raise ValueError("ddim-eta must be >= 0")
+    return True, ddim_steps, ddim_eta
+
+
 @torch.no_grad()
 def evaluate_model(
     checkpoint_path: str,
@@ -297,6 +315,11 @@ def evaluate_model(
     data_dir: str = "./data",
     stats_path: Optional[str] = None,
     use_ema: bool = True,
+    use_ddim: bool = False,
+    ddim_steps: int = 50,
+    ddim_eta: float = 0.0,
+    use_autocast: bool = True,
+    use_channels_last: bool = True,
 ) -> dict:
     """
     Evaluate a trained model by computing FID score.
@@ -310,6 +333,11 @@ def evaluate_model(
         data_dir: Directory for CIFAR-10 data
         stats_path: Optional path to precomputed CIFAR-10 stats
         use_ema: Whether to use EMA weights
+        use_ddim: Whether to use DDIM sampling
+        ddim_steps: Number of DDIM steps
+        ddim_eta: DDIM eta (0.0 = deterministic)
+        use_autocast: Whether to enable torch.autocast mixed precision
+        use_channels_last: Whether to use channels_last memory format
 
     Returns:
         Dictionary with evaluation results
@@ -321,6 +349,8 @@ def evaluate_model(
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     model = create_model(config).to(device)
+    if use_channels_last and device.type in {"cuda", "mps"}:
+        model = model.to(memory_format=torch.channels_last)
     if use_ema and "ema_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["ema_state_dict"])
         print("Using EMA weights")
@@ -333,6 +363,8 @@ def evaluate_model(
 
     # Initialize Inception model
     inception = InceptionV3Features().to(device)
+    if use_channels_last and device.type in {"cuda", "mps"}:
+        inception = inception.to(memory_format=torch.channels_last)
     inception.eval()
 
     # Generate samples and extract features
@@ -340,18 +372,32 @@ def evaluate_model(
     gen_features_list = []
     num_batches = (num_samples + batch_size - 1) // batch_size
 
+    use_ddim, ddim_steps, ddim_eta = _sampling_config(use_ddim, ddim_steps, ddim_eta)
+
     for i in tqdm(range(num_batches), desc="Generating"):
         current_batch = min(batch_size, num_samples - i * batch_size)
 
         # Generate samples
-        samples = diffusion.sample(
-            batch_size=current_batch,
-            image_size=config.model.image_size,
-            progress=False,
-        )
+        with _amp_context(device) if use_autocast else torch.autocast("cpu", enabled=False):
+            if use_ddim:
+                samples = diffusion.sample_ddim(
+                    batch_size=current_batch,
+                    image_size=config.model.image_size,
+                    num_steps=ddim_steps,
+                    eta=ddim_eta,
+                    progress=False,
+                    memory_format=torch.channels_last if use_channels_last else None,
+                )
+            else:
+                samples = diffusion.sample(
+                    batch_size=current_batch,
+                    image_size=config.model.image_size,
+                    progress=False,
+                    memory_format=torch.channels_last if use_channels_last else None,
+                )
 
         # Unnormalize from [-1, 1] to [0, 1]
-        samples = unnormalize(samples)
+        samples = unnormalize(samples.float())
         samples = torch.clamp(samples, 0, 1)
 
         # Extract features
@@ -427,6 +473,11 @@ def main():
     parser.add_argument(
         "--no-ema", action="store_true", help="Use model weights instead of EMA"
     )
+    parser.add_argument("--ddim", action="store_true", help="Use DDIM sampling")
+    parser.add_argument("--ddim-steps", type=int, default=50, help="Number of DDIM steps")
+    parser.add_argument("--ddim-eta", type=float, default=0.0, help="DDIM eta (0.0 = deterministic)")
+    parser.add_argument("--no-autocast", action="store_true", help="Disable torch.autocast")
+    parser.add_argument("--no-channels-last", action="store_true", help="Disable channels_last")
 
     # Device
     parser.add_argument(
@@ -465,6 +516,11 @@ def main():
         data_dir=args.data_dir,
         stats_path=args.stats_path,
         use_ema=not args.no_ema,
+        use_ddim=args.ddim,
+        ddim_steps=args.ddim_steps,
+        ddim_eta=args.ddim_eta,
+        use_autocast=not args.no_autocast,
+        use_channels_last=not args.no_channels_last,
     )
 
     print(f"\nFinal FID: {results['fid']:.4f}")

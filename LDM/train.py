@@ -476,6 +476,30 @@ def main():
         default=None,
         help="Comma-separated channel multipliers (e.g., '1,2,3,4')",
     )
+    parser.add_argument(
+        "--num-res-blocks",
+        type=int,
+        default=None,
+        help="Number of residual blocks per resolution",
+    )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=None,
+        help="Number of attention heads",
+    )
+    parser.add_argument(
+        "--attention-resolutions",
+        type=str,
+        default=None,
+        help="Comma-separated attention resolutions (e.g., '16,8')",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=None,
+        help="Dropout rate",
+    )
 
     # Device
     parser.add_argument(
@@ -552,6 +576,16 @@ def main():
         config.model.channel_mult = tuple(
             int(x.strip()) for x in args.channel_mult.split(",") if x.strip()
         )
+    if args.num_res_blocks is not None:
+        config.model.num_res_blocks = args.num_res_blocks
+    if args.num_heads is not None:
+        config.model.num_heads = args.num_heads
+    if args.attention_resolutions is not None:
+        config.model.attention_resolutions = tuple(
+            int(x.strip()) for x in args.attention_resolutions.split(",") if x.strip()
+        )
+    if args.dropout is not None:
+        config.model.dropout = args.dropout
 
     if config.data.image_size % config.vae.downsample_factor != 0:
         raise ValueError(

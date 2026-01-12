@@ -9,8 +9,20 @@ uv sync
 ```
 
 # ローカルで動作確認（M4 Mac）
+デフォルトは速度と品質をバランス重視で実行する`balanced`になっている
+
 ```
-./scripts/run_baseline_debug.sh
+./scripts/run_baseline.sh # 
+```
+
+速度と品質のトレードオフで切り替えができる
+
+```
+PROFILE=turbo   ./scripts/run_baseline.sh
+PROFILE=fast    ./scripts/run_baseline.sh
+PROFILE=balanced ./scripts/run_baseline.sh
+PROFILE=quality ./scripts/run_baseline.sh
+
 ```
 
 # 本番学習（クラウド）

@@ -117,6 +117,16 @@ def main():
                                help="Generate interpolation visualization")
     sample_parser.add_argument("--denoising-vis", action="store_true",
                                help="Generate denoising process visualization")
+    sample_parser.add_argument("--ddim", action="store_true",
+                               help="Use DDIM sampling with reduced steps")
+    sample_parser.add_argument("--ddim-steps", type=int, default=50,
+                               help="Number of DDIM steps (e.g., 50)")
+    sample_parser.add_argument("--ddim-eta", type=float, default=0.0,
+                               help="DDIM eta (0.0 = deterministic)")
+    sample_parser.add_argument("--no-autocast", action="store_true",
+                               help="Disable torch.autocast mixed precision")
+    sample_parser.add_argument("--no-channels-last", action="store_true",
+                               help="Disable channels_last memory format")
     sample_parser.add_argument("--device", type=str, default="cuda",
                                choices=["cuda", "mps", "cpu"],
                                help="Device to use")
@@ -129,6 +139,16 @@ def main():
                              help="Number of samples for FID calculation")
     eval_parser.add_argument("--batch-size", type=int, default=256,
                              help="Batch size")
+    eval_parser.add_argument("--ddim", action="store_true",
+                             help="Use DDIM sampling")
+    eval_parser.add_argument("--ddim-steps", type=int, default=50,
+                             help="Number of DDIM steps")
+    eval_parser.add_argument("--ddim-eta", type=float, default=0.0,
+                             help="DDIM eta (0.0 = deterministic)")
+    eval_parser.add_argument("--no-autocast", action="store_true",
+                             help="Disable torch.autocast mixed precision")
+    eval_parser.add_argument("--no-channels-last", action="store_true",
+                             help="Disable channels_last memory format")
     eval_parser.add_argument("--timesteps", type=int, default=1000,
                              help="Number of diffusion timesteps")
     eval_parser.add_argument("--beta-schedule", type=str, default="linear",

@@ -10,11 +10,11 @@ from typing import Literal, Optional
 class ModelConfig:
     """U-Net model configuration."""
 
-    image_size: int = 16  # 128 / 8 = 16 latent size
+    image_size: int = 32  # 128 / 4 = 32 latent size
     in_channels: int = 4
     out_channels: int = 4
-    model_channels: int = 128  # Larger for 16x16 latent
-    channel_mult: tuple = (1, 2, 2, 4)  # More levels for 16x16
+    model_channels: int = 128  # Match Colab setting
+    channel_mult: tuple = (1, 2, 3, 4)  # Match Colab setting for 32x32 latent
     num_res_blocks: int = 2
     attention_resolutions: tuple = (16, 8)  # Attention at 16x16 and 8x8
     dropout: float = 0.1
@@ -40,7 +40,7 @@ class VAEConfig:
 
     model_id: str = "stabilityai/sd-vae-ft-mse"
     subfolder: Optional[str] = None
-    downsample_factor: int = 8  # default value of stabilityai/sd-vae-ft-mse
+    downsample_factor: int = 4  # f=4 for 32x32 latent
     latent_channels: int = 4
     latent_scaling_factor: float = 0.18215
     cache_dir: str = "./data/latents"

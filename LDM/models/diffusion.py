@@ -285,6 +285,7 @@ class GaussianDiffusion(nn.Module):
         return_intermediates: bool = False,
         clip_denoised: bool = True,
         progress: bool = True,
+        memory_format: Optional[torch.memory_format] = None,
     ) -> torch.Tensor:
         """
         Full reverse diffusion sampling loop.
@@ -303,6 +304,8 @@ class GaussianDiffusion(nn.Module):
 
         # Start from pure noise
         x = torch.randn(shape, device=device)
+        if memory_format is not None:
+            x = x.contiguous(memory_format=memory_format)
 
         intermediates = [x] if return_intermediates else None
 
@@ -314,6 +317,8 @@ class GaussianDiffusion(nn.Module):
         for t in timesteps:
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
             x = self.p_sample(x, t_batch, clip_denoised)
+            if memory_format is not None:
+                x = x.contiguous(memory_format=memory_format)
 
             if return_intermediates:
                 intermediates.append(x)
@@ -331,6 +336,7 @@ class GaussianDiffusion(nn.Module):
         return_intermediates: bool = False,
         clip_denoised: bool = True,
         progress: bool = True,
+        memory_format: Optional[torch.memory_format] = None,
     ) -> torch.Tensor:
         """
         Generate samples.
@@ -351,6 +357,127 @@ class GaussianDiffusion(nn.Module):
             return_intermediates=return_intermediates,
             clip_denoised=clip_denoised,
             progress=progress,
+            memory_format=memory_format,
+        )
+
+    def _get_ddim_timesteps(self, num_steps: int, device: torch.device) -> torch.Tensor:
+        if num_steps < 2:
+            raise ValueError("num_steps must be >= 2 for DDIM sampling")
+        if num_steps > self.timesteps:
+            raise ValueError("num_steps cannot exceed diffusion timesteps")
+
+        step_indices = torch.linspace(0, self.timesteps - 1, steps=num_steps, device=device)
+        timesteps = step_indices.round().long()
+        timesteps[0] = 0
+        timesteps[-1] = self.timesteps - 1
+        return torch.flip(timesteps, dims=[0])
+
+    @torch.no_grad()
+    def ddim_sample_loop(
+        self,
+        shape: tuple,
+        num_steps: int = 50,
+        eta: float = 0.0,
+        return_intermediates: bool = False,
+        clip_denoised: bool = True,
+        progress: bool = True,
+        memory_format: Optional[torch.memory_format] = None,
+    ) -> torch.Tensor:
+        """
+        DDIM sampling loop with a reduced number of steps.
+
+        Args:
+            shape: Shape of samples to generate (B, C, H, W)
+            num_steps: Number of DDIM steps (e.g., 50)
+            eta: Stochasticity parameter (0.0 = deterministic)
+            return_intermediates: Whether to return intermediate samples
+            clip_denoised: Whether to clip predicted x_0 to [-1, 1]
+            progress: Whether to show progress bar
+            memory_format: Optional memory format (e.g., channels_last)
+
+        Returns:
+            Generated samples (and optionally intermediates)
+        """
+        device = self.betas.device
+        batch_size = shape[0]
+
+        x = torch.randn(shape, device=device)
+        if memory_format is not None:
+            x = x.contiguous(memory_format=memory_format)
+
+        intermediates = [x] if return_intermediates else None
+
+        timesteps = self._get_ddim_timesteps(num_steps, device=device)
+        if progress:
+            timesteps_iter = tqdm(timesteps.tolist(), desc="DDIM Sampling", leave=False)
+        else:
+            timesteps_iter = timesteps.tolist()
+
+        for i, t in enumerate(timesteps_iter):
+            t_batch = torch.full((batch_size,), int(t), device=device, dtype=torch.long)
+            predicted_noise = self.model(x, t_batch)
+
+            alpha_bar_t = self._extract(self.alphas_cumprod, t_batch, x.shape)
+            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alpha_bar_t)
+
+            x_0_pred = (x - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
+            if clip_denoised:
+                x_0_pred = torch.clamp(x_0_pred, -1.0, 1.0)
+
+            if i + 1 < len(timesteps):
+                prev_t = int(timesteps[i + 1].item())
+                prev_t_batch = torch.full((batch_size,), prev_t, device=device, dtype=torch.long)
+                alpha_bar_prev = self._extract(self.alphas_cumprod, prev_t_batch, x.shape)
+            else:
+                alpha_bar_prev = torch.ones_like(alpha_bar_t)
+
+            sigma = (
+                eta
+                * torch.sqrt((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t))
+                * torch.sqrt(1.0 - alpha_bar_t / alpha_bar_prev)
+            )
+            pred_dir = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - sigma ** 2, min=0.0)) * predicted_noise
+            x = torch.sqrt(alpha_bar_prev) * x_0_pred + pred_dir
+
+            if eta > 0.0:
+                noise = torch.randn_like(x)
+                x = x + sigma * noise
+
+            if memory_format is not None:
+                x = x.contiguous(memory_format=memory_format)
+
+            if return_intermediates:
+                intermediates.append(x)
+
+        if return_intermediates:
+            return x, intermediates
+        return x
+
+    @torch.no_grad()
+    def sample_ddim(
+        self,
+        batch_size: int,
+        image_size: int,
+        channels: int = 3,
+        num_steps: int = 50,
+        eta: float = 0.0,
+        return_intermediates: bool = False,
+        clip_denoised: bool = True,
+        progress: bool = True,
+        memory_format: Optional[torch.memory_format] = None,
+    ) -> torch.Tensor:
+        """
+        Generate samples using DDIM with fewer steps.
+        """
+        return self.ddim_sample_loop(
+            shape=(batch_size, channels, image_size, image_size),
+            num_steps=num_steps,
+            eta=eta,
+            return_intermediates=return_intermediates,
+            clip_denoised=clip_denoised,
+            progress=progress,
+            memory_format=memory_format,
         )
 
     def compute_loss(

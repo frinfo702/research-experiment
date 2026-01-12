@@ -7,7 +7,7 @@ import os
 import sys
 import argparse
 from pathlib import Path
-from typing import Optional
+from typing import Tuple
 
 import torch
 import torchvision
@@ -42,6 +42,8 @@ def load_model_from_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     model = create_model(config).to(device)
+    if device.type in {"cuda", "mps"}:
+        model = model.to(memory_format=torch.channels_last)
 
     if use_ema and "ema_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["ema_state_dict"])
@@ -62,6 +64,8 @@ def load_vae(config: Config, device: torch.device) -> AutoencoderKL:
         config.vae.model_id,
         subfolder=config.vae.subfolder,
     ).to(device, dtype=dtype)
+    if device.type in {"cuda", "mps"}:
+        vae = vae.to(memory_format=torch.channels_last)
     vae.eval()
     for param in vae.parameters():
         param.requires_grad = False
@@ -69,11 +73,36 @@ def load_vae(config: Config, device: torch.device) -> AutoencoderKL:
 
 
 @torch.no_grad()
-def decode_latents(vae, latents: torch.Tensor, scaling: float) -> torch.Tensor:
+def decode_latents(
+    vae,
+    latents: torch.Tensor,
+    scaling: float,
+    use_channels_last: bool = True,
+) -> torch.Tensor:
     latents = latents / scaling
+    if use_channels_last:
+        latents = latents.contiguous(memory_format=torch.channels_last)
     images = vae.decode(latents).sample
     images = unnormalize(images).clamp(0, 1)
     return images
+
+
+def _amp_context(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    if device.type == "mps":
+        return torch.autocast(device_type="mps", dtype=torch.float16)
+    return torch.autocast(device_type="cpu", enabled=False)
+
+
+def _sampling_config(use_ddim: bool, ddim_steps: int, ddim_eta: float) -> Tuple[bool, int, float]:
+    if not use_ddim:
+        return False, 0, 0.0
+    if ddim_steps < 2:
+        raise ValueError("ddim-steps must be >= 2")
+    if ddim_eta < 0:
+        raise ValueError("ddim-eta must be >= 0")
+    return True, ddim_steps, ddim_eta
 
 
 @torch.no_grad()
@@ -87,6 +116,11 @@ def generate_samples(
     device: torch.device,
     save_individual: bool = False,
     prefix: str = "sample",
+    use_ddim: bool = False,
+    ddim_steps: int = 50,
+    ddim_eta: float = 0.0,
+    use_autocast: bool = True,
+    use_channels_last: bool = True,
 ):
     """
     Generate samples from diffusion model.
@@ -100,6 +134,11 @@ def generate_samples(
         device: Device to use
         save_individual: Whether to save individual images
         prefix: Prefix for saved files
+        use_ddim: Whether to use DDIM sampling
+        ddim_steps: Number of DDIM steps
+        ddim_eta: DDIM eta (0.0 = deterministic)
+        use_autocast: Whether to enable torch.autocast mixed precision
+        use_channels_last: Whether to use channels_last memory format
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -107,17 +146,37 @@ def generate_samples(
     all_samples = []
     num_batches = (num_samples + batch_size - 1) // batch_size
 
+    use_ddim, ddim_steps, ddim_eta = _sampling_config(use_ddim, ddim_steps, ddim_eta)
+
     for i in tqdm(range(num_batches), desc="Generating samples"):
         current_batch_size = min(batch_size, num_samples - i * batch_size)
 
-        latents = diffusion.sample(
-            batch_size=current_batch_size,
-            image_size=config.model.image_size,
-            channels=config.model.out_channels,
-            progress=False,
-        )
+        with _amp_context(device) if use_autocast else torch.autocast("cpu", enabled=False):
+            if use_ddim:
+                latents = diffusion.sample_ddim(
+                    batch_size=current_batch_size,
+                    image_size=config.model.image_size,
+                    channels=config.model.out_channels,
+                    num_steps=ddim_steps,
+                    eta=ddim_eta,
+                    progress=False,
+                    memory_format=torch.channels_last if use_channels_last else None,
+                )
+            else:
+                latents = diffusion.sample(
+                    batch_size=current_batch_size,
+                    image_size=config.model.image_size,
+                    channels=config.model.out_channels,
+                    progress=False,
+                    memory_format=torch.channels_last if use_channels_last else None,
+                )
 
-        samples = decode_latents(vae, latents, config.vae.latent_scaling_factor)
+        samples = decode_latents(
+            vae,
+            latents,
+            config.vae.latent_scaling_factor,
+            use_channels_last=use_channels_last,
+        )
 
         all_samples.append(samples.cpu())
 
@@ -156,6 +215,8 @@ def generate_interpolation(
     num_steps: int = 10,
     output_dir: Path = Path("./samples"),
     device: torch.device = torch.device("cpu"),
+    use_autocast: bool = True,
+    use_channels_last: bool = True,
 ):
     """
     Generate interpolation between two random noise samples.
@@ -183,14 +244,24 @@ def generate_interpolation(
         # Spherical interpolation
         z = slerp(alpha.item(), z1, z2)
 
-        # Denoise from this starting point
-        x = z.clone()
-        for t in reversed(range(diffusion.timesteps)):
-            t_batch = torch.full((1,), t, device=device, dtype=torch.long)
-            x = diffusion.p_sample(x, t_batch)
+        with _amp_context(device) if use_autocast else torch.autocast("cpu", enabled=False):
+            # Denoise from this starting point
+            x = z.clone()
+            if use_channels_last:
+                x = x.contiguous(memory_format=torch.channels_last)
+            for t in reversed(range(diffusion.timesteps)):
+                t_batch = torch.full((1,), t, device=device, dtype=torch.long)
+                x = diffusion.p_sample(x, t_batch)
+                if use_channels_last:
+                    x = x.contiguous(memory_format=torch.channels_last)
 
-        decoded = decode_latents(vae, x, config.vae.latent_scaling_factor)
-        samples.append(decoded.cpu())
+            decoded = decode_latents(
+                vae,
+                x,
+                config.vae.latent_scaling_factor,
+                use_channels_last=use_channels_last,
+            )
+            samples.append(decoded.cpu())
 
     # Save as grid
     samples = torch.cat(samples, dim=0)
@@ -247,6 +318,11 @@ def generate_denoising_process(
     num_vis_steps: int = 10,
     output_dir: Path = Path("./samples"),
     device: torch.device = torch.device("cpu"),
+    use_ddim: bool = False,
+    ddim_steps: int = 50,
+    ddim_eta: float = 0.0,
+    use_autocast: bool = True,
+    use_channels_last: bool = True,
 ):
     """
     Visualize the denoising process.
@@ -258,18 +334,39 @@ def generate_denoising_process(
         num_vis_steps: Number of steps to visualize
         output_dir: Directory to save results
         device: Device to use
+        use_ddim: Whether to use DDIM sampling
+        ddim_steps: Number of DDIM steps
+        ddim_eta: DDIM eta (0.0 = deterministic)
+        use_autocast: Whether to enable torch.autocast mixed precision
+        use_channels_last: Whether to use channels_last memory format
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate samples with intermediates
-    samples, intermediates = diffusion.sample(
-        batch_size=num_images,
-        image_size=config.model.image_size,
-        channels=config.model.out_channels,
-        return_intermediates=True,
-        progress=True,
-    )
+    use_ddim, ddim_steps, ddim_eta = _sampling_config(use_ddim, ddim_steps, ddim_eta)
+
+    with _amp_context(device) if use_autocast else torch.autocast("cpu", enabled=False):
+        if use_ddim:
+            samples, intermediates = diffusion.sample_ddim(
+                batch_size=num_images,
+                image_size=config.model.image_size,
+                channels=config.model.out_channels,
+                num_steps=ddim_steps,
+                eta=ddim_eta,
+                return_intermediates=True,
+                progress=True,
+                memory_format=torch.channels_last if use_channels_last else None,
+            )
+        else:
+            samples, intermediates = diffusion.sample(
+                batch_size=num_images,
+                image_size=config.model.image_size,
+                channels=config.model.out_channels,
+                return_intermediates=True,
+                progress=True,
+                memory_format=torch.channels_last if use_channels_last else None,
+            )
 
     # Select steps to visualize
     total_steps = len(intermediates)
@@ -278,7 +375,12 @@ def generate_denoising_process(
     # Create visualization grid
     vis_samples = []
     for idx in vis_indices:
-        decoded = decode_latents(vae, intermediates[idx], config.vae.latent_scaling_factor)
+        decoded = decode_latents(
+            vae,
+            intermediates[idx],
+            config.vae.latent_scaling_factor,
+            use_channels_last=use_channels_last,
+        )
         vis_samples.append(decoded)
 
     # Stack: [num_vis_steps, num_images, C, H, W]
@@ -339,6 +441,16 @@ def main():
                         help="Generate interpolation visualization")
     parser.add_argument("--denoising-vis", action="store_true",
                         help="Generate denoising process visualization")
+    parser.add_argument("--ddim", action="store_true",
+                        help="Use DDIM sampling with reduced steps")
+    parser.add_argument("--ddim-steps", type=int, default=50,
+                        help="Number of DDIM steps (e.g., 50)")
+    parser.add_argument("--ddim-eta", type=float, default=0.0,
+                        help="DDIM eta (0.0 = deterministic)")
+    parser.add_argument("--no-autocast", action="store_true",
+                        help="Disable torch.autocast mixed precision")
+    parser.add_argument("--no-channels-last", action="store_true",
+                        help="Disable channels_last memory format")
 
     # Device
     parser.add_argument("--device", type=str, default="cuda",
@@ -396,6 +508,8 @@ def main():
             config,
             output_dir=output_dir,
             device=device,
+            use_autocast=not args.no_autocast,
+            use_channels_last=not args.no_channels_last,
         )
     elif args.denoising_vis:
         generate_denoising_process(
@@ -404,6 +518,11 @@ def main():
             config,
             output_dir=output_dir,
             device=device,
+            use_ddim=args.ddim,
+            ddim_steps=args.ddim_steps,
+            ddim_eta=args.ddim_eta,
+            use_autocast=not args.no_autocast,
+            use_channels_last=not args.no_channels_last,
         )
     else:
         generate_samples(
@@ -415,6 +534,11 @@ def main():
             output_dir=output_dir,
             device=device,
             save_individual=args.save_individual,
+            use_ddim=args.ddim,
+            ddim_steps=args.ddim_steps,
+            ddim_eta=args.ddim_eta,
+            use_autocast=not args.no_autocast,
+            use_channels_last=not args.no_channels_last,
         )
 
 
