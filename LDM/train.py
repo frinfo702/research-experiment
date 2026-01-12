@@ -6,6 +6,7 @@ import os
 import sys
 import argparse
 import random
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -188,11 +189,18 @@ def train(
         weight_decay=0.0,
     )
 
-    # Learning rate scheduler with warmup
+    # Learning rate scheduler with warmup + cosine annealing
     def lr_lambda(step):
-        if step < config.training.warmup_steps:
-            return step / config.training.warmup_steps
-        return 1.0
+        warmup_steps = max(0, config.training.warmup_steps)
+        total_steps = max(1, config.training.total_steps)
+
+        if warmup_steps > 0 and step < warmup_steps:
+            return step / warmup_steps
+
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = (step - warmup_steps) / decay_steps
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 

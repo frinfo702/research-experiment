@@ -17,6 +17,9 @@ dependencies = [
     "accelerate>=0.33.0",
     "wandb>=0.17.0",
     "python-dotenv>=1.0.1",
+    "gdown>=5.2.1",
+    "torchaudio>=2.9.1",
+    "ipykernel>=7.1.0",
 ]
 
 [project.optional-dependencies]
