@@ -163,4 +163,17 @@ Desktop.ini
 *.bak
 *.backup
 
+# Data & Weights
 data/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Outputs & Logs
+outputs/
+samples/
+logs/
+wandb/
+wandb_runs/
