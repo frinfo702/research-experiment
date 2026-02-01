@@ -177,3 +177,6 @@ samples/
 logs/
 wandb/
 wandb_runs/
+
+# quarto
+.quarto
