@@ -1,5 +1,23 @@
 project:
   title: "LDM"
 
-
-
+format:
+  html:
+    toc: true
+    toc-depth: 3
+  pdf:
+    toc: true
+    toc-depth: 3
+    pdf-engine: lualatex
+    documentclass: ltjsarticle
+    classoption:
+      - a4paper
+    include-in-header:
+      text: |
+        \usepackage{luatexja}
+        \usepackage{graphicx}
+        \makeatletter
+        \def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+        \makeatother
+        \let\Oldincludegraphics\includegraphics
+        \renewcommand{\includegraphics}[2][]{\Oldincludegraphics[width=\maxwidth,#1]{#2}}
